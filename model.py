@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
+import math
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -29,6 +30,7 @@ class ModelArgs:
     head_dim: int = 64
     rope_base: float = 10000
     norm_eps: float = 1e-5
+    gqa_aware: bool = False
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -54,7 +56,6 @@ class ModelArgs:
 
         return cls(**transformer_configs[config[0]])
 
-
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
@@ -62,26 +63,58 @@ transformer_configs = {
     "30B": dict(n_layer=60, n_head=52, dim=6656),
     "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
     "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
-    "Mistral-7B": dict(n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
+    "Mistral-7B": dict(block_size=32768, n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, vocab_size=32000),
 }
 
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim,
+                 bifurcated_attn, context_seq_len, max_new_tokens, num_parallel_samples,
+                 dtype=torch.bfloat16):
         super().__init__()
-        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.bifurcated_attn = bifurcated_attn
+        self.context_seq_len = context_seq_len
+        if self.bifurcated_attn:
+            context_cache_shape = (1, n_heads, context_seq_len, head_dim)
+            dec_cache_shape = (num_parallel_samples, n_heads, max_new_tokens, head_dim)
+            self.register_buffer('k_cache_context', torch.zeros(context_cache_shape, dtype=dtype))
+            self.register_buffer('v_cache_context', torch.zeros(context_cache_shape, dtype=dtype))
+            self.register_buffer('k_cache_dec', torch.zeros(dec_cache_shape, dtype=dtype))
+            self.register_buffer('v_cache_dec', torch.zeros(dec_cache_shape, dtype=dtype))
+            self.k_cache = {'context': self.k_cache_context, 'dec': self.k_cache_dec}
+            self.v_cache = {'context': self.v_cache_context, 'dec': self.v_cache_dec}
+        else:
+            cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+            self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+            self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
+    def update(self, input_pos, k_val, v_val, prefill=False):
+        # print("Updating. bifurcated attn", self.bifurcated_attn)
+        if self.bifurcated_attn:
+            if prefill:
+                assert self.k_cache['context'].shape == k_val.shape
+                self.k_cache['context'][:] = k_val
+                self.v_cache['context'][:] = v_val
+                return {'context': self.k_cache['context'], 'dec': None}, \
+                    {'context': self.v_cache['context'], 'dec': None}
+            else:
+                assert len(input_pos) == 1, f"input_pos: {input_pos} should be of length 1 during decoding"
+                assert k_val.size(-2) == 1
+                new_input_pos = input_pos - self.context_seq_len
+                self.k_cache['dec'][:, :, new_input_pos] = k_val
+                self.v_cache['dec'][:, :, new_input_pos] = v_val
+                return self.k_cache, self.v_cache
 
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
+        else:
+            # input_pos: [S], k_val: [B, H, S, D]
+            assert input_pos.shape[0] == k_val.shape[2]
 
-        return k_out, v_out
+            k_out = self.k_cache
+            v_out = self.v_cache
+
+            k_out[:, :, input_pos] = k_val
+            v_out[:, :, input_pos] = v_val
+
+            return k_out, v_out
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -98,34 +131,45 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
-        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+    def setup_caches(self, max_batch_size, max_seq_length, hard_reset=False,
+                     bifurcated_attn=False, context_seq_len=0, max_new_tokens=0,
+                     parallel_samples=1):
+        self.bifurcated_attn = bifurcated_attn
+        if (not hard_reset) and self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
+        # print("Initial max sequence length", max_seq_length) # 4096
         max_seq_length = find_multiple(max_seq_length, 8)
+        # print("Setting max sequence length to be ", max_seq_length) $ 4200 (4096 + 100  and round to multiples of 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim,
+                                           bifurcated_attn, context_seq_len, max_new_tokens, parallel_samples)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
+        
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, prefill: bool=False) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]
+        mask = self.causal_mask[None, None, input_pos] # [1,1, 8192, 8196]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            x = layer(x, input_pos, freqs_cis, mask, prefill=prefill)
         x = self.norm(x)
         logits = self.output(x)
         return logits
 
     @classmethod
-    def from_name(cls, name: str):
-        return cls(ModelArgs.from_name(name))
+    def from_name(cls, name: str, gqa_aware=False, block_size=None):
+        config = ModelArgs.from_name(name)
+        config.gqa_aware = gqa_aware
+        if block_size is not None:
+            config.block_size = block_size
+        return cls(config)
 
 
 class TransformerBlock(nn.Module):
@@ -136,8 +180,8 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor, prefill: bool) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, prefill=prefill)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -158,6 +202,7 @@ class Attention(nn.Module):
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self._register_load_state_dict_pre_hook(self.load_hook)
+        self.gqa_aware = config.gqa_aware
 
     def load_hook(self, state_dict, prefix, *args):
         if prefix + "wq.weight" in state_dict:
@@ -166,7 +211,7 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None, prefill=False) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -182,14 +227,52 @@ class Attention(nn.Module):
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            k, v = self.kv_cache.update(input_pos, k, v, prefill=prefill)
+            if not self.kv_cache.bifurcated_attn:
+                k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+            else:
+                if prefill:
+                    k,v = k['context'], v['context']
+                    k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                    v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:,:,:,:len(input_pos)], dropout_p=0.0)
+                else:
+                    k_context, k_dec = k['context'], k['dec']
+                    v_context, v_dec = v['context'], v['dec']
+                    
+                    if not self.gqa_aware:
+                        k_context = k_context.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                        v_context = v_context.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                        k_dec = k_dec.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                        v_dec = v_dec.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
+                    mock_bifurcated = False 
+                    if not mock_bifurcated:
+                        # for testing purposes
+                        if self.gqa_aware:
+                            y = scaled_dot_product_attention_bifurcated_gqa(
+                                q, k_context, k_dec,
+                                v_context, v_dec,
+                                attn_mask=None,
+                                dropout_p=0.0
+                            )
+                        else:
+                            y = scaled_dot_product_attention_bifurcated(q, k_context, k_dec,
+                                                                    v_context, v_dec,
+                                                                    attn_mask=None,
+                                                                    dropout_p=0.0
+                                                                    )
+                    else:
+                        k_context = k_context.repeat(q.shape[0], 1, 1, 1)
+                        v_context = v_context.repeat(q.shape[0], 1, 1, 1)
+                        k = torch.cat([k_context, k_dec], dim=-2)
+                        v = torch.cat([v_context, v_dec], dim=-2)
+                        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:,:,:,:k.size(-2)], dropout_p=0.0)
+        
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
-
         y = self.wo(y)
         return y
 
@@ -231,6 +314,8 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
+    # print('at rotary - x shape', x.shape)
+    # print('freq_cis', freqs_cis.shape)
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
@@ -243,3 +328,94 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
 
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
+
+def scaled_dot_product_attention(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
+    # attn_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0) if is_causal else attn_mask
+    if attn_mask is not None:
+        print("attn_mask", attn_mask)
+        attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
+        attn_weight = torch.softmax((Q @ K.transpose(-2, -1) * scale_factor) + attn_mask, dim=-1)
+    else:
+        attn_weight = torch.softmax((Q @ K.transpose(-2, -1) * scale_factor), dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+    return attn_weight @ V
+
+def scaled_dot_product_attention_einsum(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    # q: bhnk, k: bgmk, v: bgmv
+    # or       k: gmk   v: gmv
+    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
+    if attn_mask is not None:
+        attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
+        attn_weight = torch.softmax((torch.einsum("bhnk,bhmk->bhnm", Q, K) * scale_factor) + attn_mask, dim=-1)
+    else:
+        attn_weight = torch.softmax((torch.einsum("bhnk,bhmk->bhnm", Q, K) * scale_factor), dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+    return torch.einsum("bhnm,bhmv->bhnv", attn_weight, V)
+
+def scaled_dot_product_attention_bifurcated_context(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    # q: bhnk, 
+    #          k: 1gmk   v: 1gmv
+    assert K.size(0) == 1 and V.size(0) == 1, "K should have a batch size of 1 for bifurcated context"
+    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
+    if attn_mask is not None:
+        attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
+        attn_weight = torch.softmax((torch.einsum("bhnk,hmk->bhnm", Q, K) * scale_factor) + attn_mask, dim=-1)
+    else:
+        attn_weight = torch.softmax((torch.einsum("bhnk,hmk->bhnm", Q, K) * scale_factor), dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+    return torch.einsum("bhnm,hmv->bhnv", attn_weight, V)
+
+def scaled_dot_product_attention_bifurcated_incremental(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    assert Q.size(-2) == 1, "Q should have a sequence length of 1 for incremental decoding"
+    # note: generalize for speculative decoding
+    return scaled_dot_product_attention_einsum(Q, K, V, attn_mask, dropout_p, is_causal, scale)
+
+def scaled_dot_product_attention_bifurcated(Q, K_context, K_dec, V_context, V_dec, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    # q: bhnk, 
+    # context     k: 1hMk   v: 1hMv
+    # incremental k: bhmk   v: bhmv
+
+    assert K_context.size(0) == 1 and V_context.size(0) == 1, "K should have a batch size of 1 for bifurcated context"
+    assert Q.size(-2) == 1, f"At incremental decoding phase with bifurcated attention, expecting query length = 1. Current query length = {Q.size(-2)}"
+    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
+    attn_weight = torch.softmax(
+            (torch.cat([torch.einsum("bhnk,hMk->bhnM", Q, K_context.squeeze(0)),
+                        torch.einsum("bhnk,bhmk->bhnm", Q, K_dec)
+                        ], dim=-1) * scale_factor),
+            dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+    M = K_context.size(-2)
+    attn_weight_context, attn_weight_dec = attn_weight[:,:,:,:M], attn_weight[:,:,:,M:]
+    return torch.einsum("bhnM,hMv->bhnv", attn_weight_context, V_context.squeeze(0)) + \
+        torch.einsum("bhnm,bhmv->bhnv", attn_weight_dec, V_dec)
+
+
+def scaled_dot_product_attention_bifurcated_gqa(Q, K_context, K_dec, V_context, V_dec, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    # q: bhnk, 
+    # context     k: 1gMk   v: 1gMv
+    # incremental k: bgmk   v: bgmv
+
+    assert K_context.size(0) == 1 and V_context.size(0) == 1, "K should have a batch size of 1 for bifurcated context"
+    assert Q.size(-2) == 1, f"At incremental decoding phase with bifurcated attention, expecting query length = 1. Current query length = {Q.size(-2)}"
+    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
+    # reshape Q to be bpgnk where h = p*g numerically
+    assert K_context.size(1) == V_context.size(1)
+    g = K_context.size(1)
+    h = Q.size(1)
+    assert h % g == 0
+    Q = Q.view(Q.size(0), -1, g, Q.size(2), Q.size(3))
+
+
+    attn_weight = torch.softmax(
+            (torch.cat([torch.einsum("bpgnk,gMk->bpgnM", Q, K_context.squeeze(0)),
+                        torch.einsum("bpgnk,bgmk->bpgnm", Q, K_dec)
+                        ], dim=-1) * scale_factor),
+            dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
+    M = K_context.size(-2)
+    attn_weight_context, attn_weight_dec = attn_weight[:,:,:,:,:M], attn_weight[:,:,:,:,M:]
+    y = torch.einsum("bpgnM,gMv->bpgnv", attn_weight_context, V_context.squeeze(0)) + \
+        torch.einsum("bpgnm,bgmv->bpgnv", attn_weight_dec, V_dec)
+    y = y.reshape(y.size(0), h, y.size(-2), y.size(-1))
+    return y

@@ -14,3 +14,4 @@ wandb
 # downloaded by our tests
 original_model.py
 original_adapter.py
+.vscode/sftp.json

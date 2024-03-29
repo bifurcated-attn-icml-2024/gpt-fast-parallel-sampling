@@ -1,3 +1,91 @@
+# Bifurcated Attention Results
+
+For the following results, we use context length = 8192, model size = 7B with H100 GPU.
+
+- The setting without bifurcated attention uses Flash Attention via torch's scaled dot product attention.
+
+- The bifurcated attention setting also uses FlashAttention using the prefill phase. (that is, bifurcated attention is only applicable for the decode phase)
+
+- The prefill phase takes ~247 ms in all settings (corresponding to 464.32 Tera FLOPs)
+
+
+
+| # Parallel Samples | Torch Compile | w/ bifurcated attn: Per step latency (ms) | Tera FLOPs per sec | w/o bifurcated attn: Per step latency (ms) | Tera FLOPs per sec |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Yes | 9.47 | 1.48 | 9.6 | 1.46 |
+| 2 | Yes | 14.84 | 1.89 | 11.30 | 2.48 |
+| 4 | Yes | 14.97 | 3.74 | 14.05 | 3.99 |
+| 8 | Yes | 15.26 | 7.34 | 18.08 | 6.19 |
+| 16 | Yes | 15.24 | 14.70 | 27.04 | 8.28 |
+| 32 | Yes | 16.11 | 27.81 | OOM | OOM |
+| 64 | Yes | 17.19 | 5.21 |  |  |
+| 128 | Yes | 20.39 | 87.89 |  |  |
+| 256 | Yes | 27.86 | 128.64 |  |  |
+| 512 | Yes | 45.09 | 158.97 |  |  |
+| 1024 | Yes | 82.10 | 174.62 |  |  |
+| 2048 |  | OOM | OOM |  |  |
+
+
+
+| # Parallel Samples | Torch Compile | w/ bifurcated attn: Per step latency (ms) | Tera FLOPs per sec | w/o bifurcated attn: Per step latency (ms) | Tera FLOPs per sec |
+| --- | --- | --- | --- | --- | --- |
+| 1 | No | 33.70 | 0.42 | 26.22 | 0.53 |
+| 2 | No | 32.78 | 0.85 | 29.32 | 0.95 |
+| 4 | No | 33.14 | 1.69 | 44.13 | 1.27 |
+| 8 | No | 33.12 | 3.38 | 73.70 | 1.52 |
+| 16 | No | 35.40 | 6.33 | 133.51 | 1.68 |
+| 32 | No | 33.05 | 13.56 | 251.78 | 1.78 |
+| 64 | No | 36.48 | 24.56 | OOM | OOM |
+| 128 | No | 49.44 | 36.25 |  |  |
+| 256 | No | 75.92 | 47.21 |  |  |
+| 512 | No | 131.51 | 54.51 |  |  |
+| 1024 | No | 243.45 | 58.89 |  |  |
+| 2048 | No | 474.58 | 60.42 |  |  |
+
+
+Additionally, we also provide results with A100 GPU for context 4K (4097) as well as 8K (8192) tokens.
+
+#### Wtih torch compile
+
+| # Parallel Samples | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) |
+| --- | --- | --- | --- | --- |
+| Context Size | 4k | 4k | 8k | 8k |
+| 1 | 13.97 | 14.42 | 18.38 | 18.75 |
+| 2 | 15.51 | 17.58 | 20.58 | 23.58 |
+| 4 | 15.66 | 19.06 | 19.88 | 26.54 |
+| 8 | 16.03 | 23.09 | 20.09 | 34.69 |
+| 16 | 16.72 | 30.94 | 20.79 |  |
+| 32 | 18.62 |  | 22.66 |  |
+| 64 | 19.96 |  | 24.98 |  |
+| 128 | 26.90 |  | 32.98 |  |
+| 256 | 39.71 |  | 50.65 |  |
+| 512 | 66.51 |  | 84.20 |  |
+
+#### Without torch compile
+
+| # Parallel Samples | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) |
+| --- | --- | --- | --- | --- |
+| Context Size | 4k | 4k | 8k | 8k |
+| 1 | 42.81 | 35.15 | 48.23 | 39.45 |
+| 2 | 44.74 | 35.84 | 46.60 | 52.33 |
+| 4 | 44.49 | 50.31 | 47.32 | 79.68 |
+| 8 | 43.79 | 78.62 | 47.06 | 134.57 |
+| 16 | 45.07 | 135.37 | 46.63 | 244.37 |
+| 32 | 43.78 | 248.51 | 47.19 |  |
+| 64 | 43.57 |  | 46.27 |  |
+| 128 | 44.03 |  | 50.18 |  |
+| 256 | 59.75 |  | 77.64 |  |
+| 512 | 97.42 |  | 129.44 |  |
+
+
+
+<br>
+<br>
+<br>
+<br>
+
+Original README for gpt-fast is retained below.
+
 # gpt-fast
 Simple and efficient pytorch-native transformer text generation.
 
