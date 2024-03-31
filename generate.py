@@ -15,6 +15,7 @@ import torch._inductor.config
 import copy
 import wandb
 import json
+import os
 
 def device_sync(device):
     if "cuda" in device:
@@ -41,7 +42,6 @@ from model import Transformer
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1) # exponential distribution
-    # TODO -- make sure it's exponential along each batch index
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
@@ -75,23 +75,25 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, parallel_samples, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
+    print("Enabling SDPA flash", args.enable_sdpa_flash)
     for i in range(num_new_tokens):
-        with torch.backends.cuda.sdp_kernel(enable_flash=args.enable_flash, enable_mem_efficient=False, enable_math=True):
+        with torch.backends.cuda.sdp_kernel(enable_flash=bool(args.enable_sdpa_flash),
+                                            enable_mem_efficient=bool(args.enable_mem_efficient),
+                                            enable_math=bool(args.enable_math)):
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
             input_pos += 1
-            callback(next_token.clone()) # what does this do?
-            new_probs.append(next_prob.clone())
-            # next_token_shape = b, 1, 1 (last 1 is due to max over V)
             cur_token = next_token.view(parallel_samples, -1)
-            new_tokens.append(cur_token)
+            new_tokens.append(cur_token.clone())
+            callback(new_tokens[-1]) # what does this do?
+            new_probs.append(next_prob.clone())
 
     return new_tokens, new_probs
 
 
 def model_forward(model, x, input_pos):
-    return model(x, input_pos) # TODO -- need to add prefill flag here
+    return model(x, input_pos)
 
 def speculative_decode(
     model: Transformer,
@@ -144,24 +146,27 @@ def speculative_decode(
         return torch.cat([draft_tokens[:accept_length], next_token])
 
 
-def prepare_parallel_sampling_kv(model, num_parallel_samples, bifurcated_attn=False):
+def prepare_parallel_sampling_kv(model, num_parallel_samples, bifurcated_kv=False):
     b = num_parallel_samples
     # expand by reference K and V
     for idx, _ in enumerate(model.layers):
         # for bifurcated, we do not need to repeat the batch indices
-        if not bifurcated_attn:
+        if not bifurcated_kv:
             # expand by reference K and V does not work because K and V include incremental decoding positions
             # another way is to reference only the context part, then make the incremental decoding part is separate
+            # [context ref] + [inc1]
+            # [context ref] + [inc2]
+            # would this work for reference or would it just copy the tensor anyways?
             k_cache = model.layers[idx].attention.kv_cache.k_cache # [1, g, m, k]
             v_cache = model.layers[idx].attention.kv_cache.v_cache # [1, g, m, v]
             model.layers[idx].attention.kv_cache.k_cache = k_cache.repeat(b, 1, 1, 1)
             model.layers[idx].attention.kv_cache.v_cache = v_cache.repeat(b, 1, 1, 1)
 
 
-def prepare_parallel_sampling(seq, num_parallel_samples, model, bifurcated_attn=False):
+def prepare_parallel_sampling(seq, num_parallel_samples, model, bifurcated_kv=False):
     if num_parallel_samples > 1:
         seq = seq.repeat(num_parallel_samples, 1)
-        prepare_parallel_sampling_kv(model, num_parallel_samples, bifurcated_attn)
+        prepare_parallel_sampling_kv(model, num_parallel_samples, bifurcated_kv)
     return seq
 
 @torch.no_grad()
@@ -170,6 +175,7 @@ def generate(
     prompt: torch.Tensor,
     max_new_tokens: int,
     parallel_samples: int = 1,
+    bifurcated_kv: bool = False,
     bifurcated_attn: bool = False,
     *,
     interactive: bool,
@@ -194,9 +200,14 @@ def generate(
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
         model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, hard_reset=True,
+                           bifurcated_kv=bifurcated_kv,
                            bifurcated_attn=bifurcated_attn,
                            context_seq_len=T, max_new_tokens=max_new_tokens,
-                           parallel_samples=parallel_samples)
+                           parallel_samples=parallel_samples,
+                           use_flash2_prefill=bool(args.use_flash2_prefill),
+                           use_flash2_decode=bool(args.use_flash2_decode),
+                           use_sdpa_flash=bool(args.enable_sdpa_flash),
+                           )
                            
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
@@ -211,7 +222,7 @@ def generate(
     
     if is_speculative:
         prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq = prepare_parallel_sampling(seq, parallel_samples, model, bifurcated_attn)
+    seq = prepare_parallel_sampling(seq, parallel_samples, model, bifurcated_kv)
 
 
     if parallel_samples > 1:
@@ -222,7 +233,6 @@ def generate(
     prefil_time = time.perf_counter() - t0
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    # input position -- why do we need? for rope?
     accept_counts = [0] * (speculate_k + 1)
     
     # model.layers[0].attention.kv_cache.k_cache.size() = bgm'k where m' is the rounded up context length + max new tokens
@@ -253,6 +263,7 @@ def generate(
             seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
         else:
             seq[T + 1:] = torch.cat(generated_tokens, dim=-1)
+
     generate_stats = {
         'accept_counts': accept_counts,
         'prefill_time': prefil_time
@@ -319,10 +330,10 @@ def main(
     speculate_k: int = 5,
     device='cuda',
     parallel_samples=1,
+    bifurcated_kv=False,
     bifurcated_attn=False,
     wandb_group=None,
     log_filename=None,
-    bifurcated_type=None,
     gqa_aware=None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
@@ -373,9 +384,7 @@ def main(
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
         print("#### Setting torch.compile")
-        # essentially decode_one_token is a function
-        # torch.compile will compile that function to make things more efficient
-        # What does torch.compile really do in the backend?
+        # torch.compile will compile `decode_one_token` function to be a fused kernel
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
@@ -394,33 +403,34 @@ def main(
     if args.burn_in:
         start -= 1
     # need to burn -- othertime the prefill time for the first one is very high
-        
-    wandb.init(project='bifurcated_attn',
-               group=wandb_group)
-    wandb.config.update(
-        {
-            "prompt_len": prompt_len,
-            "interactive": interactive,
-            "num_repetitions": num_repetitions,
-            "max_new_tokens": max_new_tokens,
-            "top_k": top_k,
-            "temperature": temperature,
-            "checkpoint_path": checkpoint_path,
-            "compile": compile,
-            "compile_prefill": compile_prefill,
-            "profile": profile,
-            "speculate_k": speculate_k,
-            "device": device,
-            "parallel_samples": parallel_samples,
-            "bifurcated_attn": bifurcated_attn,
-            "wandb_group": wandb_group,
-            "log_filename": log_filename,
-            "gqa_aware": gqa_aware,
-            "device": device,
-            "log_filename": log_filename,
-            "interactive": interactive,
-        }
-    )
+    
+    if wandb_group is not None:
+        wandb.init(project='bifurcated_attn',
+                group=wandb_group)
+        wandb.config.update(
+            {
+                "prompt_len": prompt_len,
+                "interactive": interactive,
+                "num_repetitions": num_repetitions,
+                "max_new_tokens": max_new_tokens,
+                "top_k": top_k,
+                "temperature": temperature,
+                "checkpoint_path": checkpoint_path,
+                "compile": compile,
+                "compile_prefill": compile_prefill,
+                "profile": profile,
+                "speculate_k": speculate_k,
+                "device": device,
+                "parallel_samples": parallel_samples,
+                "bifurcated_attn": bifurcated_attn,
+                "wandb_group": wandb_group,
+                "log_filename": log_filename,
+                "gqa_aware": gqa_aware,
+                "device": device,
+                "log_filename": log_filename,
+                "interactive": interactive,
+            }
+        )
     
     for i in range(start, num_repetitions):
         device_sync(device=device) # MKG
@@ -460,6 +470,7 @@ def main(
                 encoded,
                 max_new_tokens,
                 parallel_samples,
+                bifurcated_kv=bifurcated_kv,
                 bifurcated_attn=bifurcated_attn,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
@@ -487,15 +498,20 @@ def main(
         t = time.perf_counter() - t0
 
 
-        if bool(args.display) and not interactive:
+        if bool(args.display) and not interactive and i == num_repetitions - 1:
             if parallel_samples > 1:
-                print("********** prompt **********")
-                print(tokenizer.decode(encoded.tolist()))
+                if args.display_prompt:
+                    print("********** prompt **********")
+                    print(tokenizer.decode(encoded.tolist()))
                 for j in range(parallel_samples):
                     print(f"---------- Parallel Sample {i}/{j} ---------")
                     print(tokenizer.decode(y[j].tolist()[prompt_length:]))
             else:
-                print(tokenizer.decode(y.tolist()))
+                if args.display_prompt:
+                    print("********** prompt **********")
+                    print(tokenizer.decode(encoded.tolist()))
+                print("Generated Text:")
+                print(tokenizer.decode(y.tolist()[prompt_length:]))
         else:
             print()
         tokens_generated = y.size(-1) - prompt_length
@@ -514,10 +530,12 @@ def main(
 
     print(f"Prompt length: {prompt_length} | Model block size {model.config.block_size}")
     print(f"Num parallel samples: {parallel_samples}")
-    # tensor parallel
+    
     print(f"Compile = ** {compile} ** Compile prefill = {compile_prefill} Profile = {profile}")
-    print(f"Enable Flash = {args.enable_flash} Enable Mem Efficient = {args.enable_mem_efficient} Enable Math = {args.enable_math}")
-    print(f"Bifurcated Attention = ** {bifurcated_attn} **")
+    print(f"Enable SDPA Flash = {args.enable_sdpa_flash} Enable Mem Efficient = {args.enable_mem_efficient} Enable Math = {args.enable_math}")
+    print(f"Bifurcated Attention = ** {bifurcated_attn} Bifurcated KV = ** {bifurcated_kv} ")
+    print(f"Using Flash2 prefill = {args.use_flash2_prefill} Using Flash2 decode = {args.use_flash2_decode}")
+    print(f"GQA aware = {args.gqa_aware} Quantization = {args.model_quantization}")
     print(f"Burn in time (prefill): {burnin_time:.2f} (ms)")
     memory_used = torch.cuda.max_memory_reserved() / 1e9
     print(f"Memory used: {memory_used:.02f} GB")
@@ -541,8 +559,14 @@ def main(
         "compile_prefill": compile_prefill,
         "speculate_k": speculate_k,
         "parallel_samples": parallel_samples,
+        "bifurcated_kv": bifurcated_kv,
         "bifurcated_attn": bifurcated_attn,
-        "bifurcated_type": bifurcated_type,
+        "gqa_aware": gqa_aware,
+        "use_flash2_prefill": args.use_flash2_prefill,
+        "use_flash2_decode": args.use_flash2_decode,
+        "enable_sdpa_flash": args.enable_sdpa_flash,
+        "enable_mem_efficient": args.enable_mem_efficient,
+        "enable_math": args.enable_math,
         "tokens_per_sec": tokens_per_sec,
         "prefill_mean": prefill_mean,
         "prefill_std": prefill_std,
@@ -553,8 +577,9 @@ def main(
         "memory_used": memory_used, 
         "mean_accepted": sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated) if is_speculative else None,
     }
-    wandb.log(result_dict)
-    wandb.finish()
+    if wandb_group is not None:
+        wandb.log(result_dict)
+        wandb.finish()
 
     if log_filename:
         with open(log_filename, 'a') as f:
@@ -579,7 +604,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_new_tokens', type=int, default=128, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/mistralai/Mistral-7B-v0.1/model.pth"), help='Model checkpoint path.')
+    #parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/mistralai/Mistral-7B-v0.1/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
@@ -587,9 +613,8 @@ if __name__ == '__main__':
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default="cuda", help='Device to use')
     parser.add_argument('--attention_type', type=str, default='sdpa')
-    parser.add_argument('--enable_flash', type=bool, default=True)
-    parser.add_argument('--enable_mem_efficient', type=bool, default=False)
-    parser.add_argument('--enable_math', type=bool, default=False)
+    parser.add_argument('--enable_sdpa_flash', type=int, default=0)
+    parser.add_argument('--enable_mem_efficient', type=int, default=0)
     parser.add_argument('--block_size', type=int, default=32768)
     parser.add_argument('--display', type=int, default=0)
     parser.add_argument('--burn_in', type=int, default=1)
@@ -598,6 +623,11 @@ if __name__ == '__main__':
                         default=1,
                         help='The number of parallel samples. Enabled if > 1'
                         )
+    parser.add_argument('--bifurcated_kv',
+                        type=int,
+                        default=0,
+                        help="Store KV in bifurcated mode"
+                        )
     parser.add_argument('--bifurcated_attn',
                         type=int,
                         default=0,
@@ -605,18 +635,32 @@ if __name__ == '__main__':
                         )
     parser.add_argument('--wandb_group', type=str, default=None, help='Wandb group name')
     parser.add_argument('--log_file', type=str, default="results.jsonl", help='Log file name')
-    parser.add_argument('--bifurcated_type', type=str, default="v1", help="")
+    parser.add_argument('--display_prompt', type=int, default=0, help="Display prompt")
     parser.add_argument('--gqa_aware', type=int, default=0, help="GQA aware during attention computation")
+    parser.add_argument('--use_flash2_prefill', type=int, default=0, help="Using flash attention for prefill")
+    parser.add_argument('--use_flash2_decode', type=int, default=0, help="Using flash attention for decoding")
+    parser.add_argument('--model_quantization', type=str, default=None, help="Model quantization")
 
     args = parser.parse_args()
 
-    if args.prompt_file is not None:
+    if args.model_quantization is not None and args.model_quantization.lower() != "none":
+        args.checkpoint_path = Path(args.checkpoint_path.parent / f"{args.checkpoint_path.stem}_{args.model_quantization}.pth")
+        print(f"Quantized model path: {args.checkpoint_path}")
+    
+    if args.enable_sdpa_flash:
+        args.enable_math = 0
+    elif args.enable_sdpa_flash == 0:
+        args.enable_math = 1
+
+    if args.bifurcated_attn:
+        print(f"Setting bifurcated_kv memory to {args.bifurcated_kv} since it's required for bifurcated attention.")
+        args.bifurcated_kv = 1
+
+    if args.prompt_file is not None and os.path.exists(args.prompt_file):
         args.prompt = load_content(args.prompt_file)
-    # need to control the length as well
-    # but perhaps do this later
     main(
         args.prompt, args.prompt_len, args.interactive, args.num_repetitions, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device, args.parallel_samples, bool(args.bifurcated_attn), args.wandb_group, args.log_file,
-        args.bifurcated_type, args.gqa_aware
+        args.speculate_k, args.device, args.parallel_samples, bool(args.bifurcated_kv), bool(args.bifurcated_attn),
+        args.wandb_group, args.log_file, args.gqa_aware
     )

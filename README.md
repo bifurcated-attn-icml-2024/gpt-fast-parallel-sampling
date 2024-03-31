@@ -1,81 +1,171 @@
 # Bifurcated Attention Results
 
-For the following results, we use context length = 8192, model size = 7B with H100 GPU.
 
-- The setting without bifurcated attention uses Flash Attention via torch's scaled dot product attention.
-
-- The bifurcated attention setting also uses FlashAttention using the prefill phase. (that is, bifurcated attention is only applicable for the decode phase)
-
-- The prefill phase takes ~247 ms in all settings (corresponding to 464.32 Tera FLOPs)
-
-
-
-| # Parallel Samples | Torch Compile | w/ bifurcated attn: Per step latency (ms) | Tera FLOPs per sec | w/o bifurcated attn: Per step latency (ms) | Tera FLOPs per sec |
-| --- | --- | --- | --- | --- | --- |
-| 1 | Yes | 9.47 | 1.48 | 9.6 | 1.46 |
-| 2 | Yes | 14.84 | 1.89 | 11.30 | 2.48 |
-| 4 | Yes | 14.97 | 3.74 | 14.05 | 3.99 |
-| 8 | Yes | 15.26 | 7.34 | 18.08 | 6.19 |
-| 16 | Yes | 15.24 | 14.70 | 27.04 | 8.28 |
-| 32 | Yes | 16.11 | 27.81 | OOM | OOM |
-| 64 | Yes | 17.19 | 5.21 |  |  |
-| 128 | Yes | 20.39 | 87.89 |  |  |
-| 256 | Yes | 27.86 | 128.64 |  |  |
-| 512 | Yes | 45.09 | 158.97 |  |  |
-| 1024 | Yes | 82.10 | 174.62 |  |  |
-| 2048 |  | OOM | OOM |  |  |
+## Summary
+- Below, we show that context-aware bifurcated attention helps reduce parallel sampling latency significantly for both MHA and GQA architectures.
+- Bifurcated attention is implemented in native torch, which can directly benefit from torch compile and outperforms FlashAttention2.
+- We note that the bifurcated attention kernel is only for the `decode` step, which means that in the `prefill` step, we can use any kernel that is efficient such as `flash`. For example, with context length `8192`, FlashAttention2 results in latency ~ `130 ms` compared to `247 ms` for Torch SDPA. That is, we can use any kernel at prefill phase and use bifurcated attention for high decoding workload.
+- For non context aware kernel, storing all KV in contiguous memory incurs significant memory cost for parallel sampling. In order to avoid out-of-memory,
+we also include the `non contiguous` setting we use the bifurcated attention memory setup (keeping only one copy of the context and expand by reference to different batch indices). In the contiguous memory case, we keep explicit KV cache of context for all batch indices. We show that even though the non contiguous case avoids early OOM, the latencies are still much higher than bifurcated attention.
+- Native flash 2 is not yet compatible with torch compile.
 
 
+## Comparing kernels
 
-| # Parallel Samples | Torch Compile | w/ bifurcated attn: Per step latency (ms) | Tera FLOPs per sec | w/o bifurcated attn: Per step latency (ms) | Tera FLOPs per sec |
-| --- | --- | --- | --- | --- | --- |
-| 1 | No | 33.70 | 0.42 | 26.22 | 0.53 |
-| 2 | No | 32.78 | 0.85 | 29.32 | 0.95 |
-| 4 | No | 33.14 | 1.69 | 44.13 | 1.27 |
-| 8 | No | 33.12 | 3.38 | 73.70 | 1.52 |
-| 16 | No | 35.40 | 6.33 | 133.51 | 1.68 |
-| 32 | No | 33.05 | 13.56 | 251.78 | 1.78 |
-| 64 | No | 36.48 | 24.56 | OOM | OOM |
-| 128 | No | 49.44 | 36.25 |  |  |
-| 256 | No | 75.92 | 47.21 |  |  |
-| 512 | No | 131.51 | 54.51 |  |  |
-| 1024 | No | 243.45 | 58.89 |  |  |
-| 2048 | No | 474.58 | 60.42 |  |  |
+We show different workloads with various number of `parallel samples` where include results for both MHA and GQA. Results are obtained with 1 H100 GPU for 7B model.
+
+### MHA
+
+- MHA is more IO intensive than GQA, therefore bifurcated attention helps significantly even compared to highly efficient kernels. Below, we use context length 8K with varying number of parallel samples.
 
 
-Additionally, we also provide results with A100 GPU for context 4K (4097) as well as 8K (8192) tokens.
+#### MHA 8K Context
 
-#### Wtih torch compile
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Flash + Non contiguous + Compile |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 8.639 | 30.389 | 24.069 | 26.397 | **8.776** | 24.543 | 22.00 | 23.431 | 10.665 |
+| 2 | 11.774 | 31.371 | 24.498 | 28.706 | **10.505** | 31.533 | 24.771 | 31.658 | 14.449 |
+| 4 | **12.030** | 31.440 | 39.664 | 43.361 | 13.227 | 50.539 | 38.867 | 51.065 | 23.205 |
+| 8 | **12.358** | 33.722 | 60.924 | 72.705 | 17.330 | 84.519 | 61.225 | 84.987 | 35.421 |
+| 16 | **12.595** | 31.707 | 109.647 | 132.89 | 26.192 | 155.847 | 109.457 | 159.816 | 63.679 |
+| 32 | **13.471** | 31.788 | 205.578 | 251.024 | - | 305.395 | 205.921 | 306.598 | 120.395 |
+| 64 | **15.355** | 35.267 | OOM | OOM | - | 599.084 | - | 601.480 | 238.192 |
+| 128 | **19.561** | 48.699 | - | - | - | 1183.460 | - | OOM | OOM |
+| 256 | **27.146** | 75.212 | - | - | - | 1842.982 | - | - | - |
+| 512 | **44.332** | 130.587 | - | - | - | - | - | - | - |
+| 1024 | **81.146** | 242.738 | - | - | - | - | - | - | - |
+| 2048 | OOM | 473.741 | - | - | - | - | - | - | - |
 
-| # Parallel Samples | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) |
+#### MHA 16K Context
+
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Flash + Non contiguous + Compile |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 12.163 | 30.658 | 26.282 | 30.134 | 13.055 | 30.485 | 26.224 | 30.195 | 15.525 |
+| 2 | 17.170 | 32.619 | 37.723 | 44.737 | **15.349** | 51.304 | 38.248 | 51.235 | 22.456 |
+| 4 | **17.327** | 33.438 | 65.980 | 73.621 | 20.650 | 91.245 | 65.828 | 90.755 | 39.511 |
+| 8 | **18.070** | 34.665 | 110.313 | 132.294 | 32.058 | 159.959 | 110.552 | 160.391 | 64.221 |
+| 16 | **18.462** | 36.780 | 206.926 | 251.473 | OOM | 306.745 | 206.517 | 307.313 | 119.871 |
+| 32 | **19.920** | 41.927 | OOM | OOM | - | 601.096 | OOM | 603.612 | 237.891 |
+| 64 | **22.958** | 50.530 | - | - | - | 1195.347 | - | OOM | OOM |
+| 128 | **28.976** | 68.306 | - | - | - | 1908.226 | - | - | - |
+| 256 | **40.070** | 106.100 | - | - | - | OOM | - | - | - |
+| 512 | **65.020** | 183.143 | - | - | - | - | - | - | - |
+| 1024 | **117.753** | 339.738 | - | - | - | - | - | - | - |
+| 2048 | OOM | 660.198 | - | - | - | - | - | - | - |
+
+
+#### MHA 32K Context
+
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Flash + Non contiguous + Compile |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 20.898 | 39.972 | 37.674 | 44.942 | **19.797** | 67.443 | 37.463 | 67.299 | 30.394 |
+| 2 | **29.338** | 48.614 | 55.941 | 69.224 | OOM | 156.610 | 55.855 | 156.352 | 47.625 |
+| 4 | **29.726** | 49.768 | OOM | OOM | - | 300.468 | OOM | 300.965 | 90.191 |
+| 8 | **30.295** | 51.309 | - | - | - | 567.933 | - | 568.811 | 152.187 |
+| 16 | **30.657** | 54.921 | - | - | - | 670.205 | - | 672.421 | 290.593 |
+| 32 | **32.149** | 62.284 | - | - | - | 1318.045 | - | 1323.246 | 569.741 |
+| 64 | **35.254** | 75.220 | - | - | - | OOM | - | OOM | OOM |
+| 128 | **41.440** | 101.175 | - | - | - | - | - | - | - |
+| 256 | OOM | 159.089 | - | - | - | - | - | - | - |
+| 512 | - | 277.047 | - | - | - | - | - | - | - |
+| 1024 | - | OOM | - | - | - | - | - | - | - |
+
+
+
+### GQA
+
+- For GQA, bifurcated attention is able to help scale to very large inference workload. Using torch.compile mode makes the inference much faster compared than Flash2. Below, we consider context length 8K, 16K and 32K.
+- Note that torch SDPA does not directly support and the latency will be the same as the MHA case (which is worse, and is not included for direct comparison here).
+
+
+
+#### GQA with 8K context length
+
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Flash2 (non contiguous) |
 | --- | --- | --- | --- | --- |
-| Context Size | 4k | 4k | 8k | 8k |
-| 1 | 13.97 | 14.42 | 18.38 | 18.75 |
-| 2 | 15.51 | 17.58 | 20.58 | 23.58 |
-| 4 | 15.66 | 19.06 | 19.88 | 26.54 |
-| 8 | 16.03 | 23.09 | 20.09 | 34.69 |
-| 16 | 16.72 | 30.94 | 20.79 |  |
-| 32 | 18.62 |  | 22.66 |  |
-| 64 | 19.96 |  | 24.98 |  |
-| 128 | 26.90 |  | 32.98 |  |
-| 256 | 39.71 |  | 50.65 |  |
-| 512 | 66.51 |  | 84.20 |  |
+| 1 | **10.561** | 28.365 | 21.760 | 23.475 |
+| 2 | **11.351** | 29.526 | 22.460 | 39.930 |
+| 4 | **11.515** | 29.578 | 22.570 | 71.567 |
+| 8 | **11.786** | 29.576 | 22.649 | 126.353 |
+| 16 | **11.719** | 30.265 | 22.310 | 240.963 |
+| 32 | **12.495** | 29.755 | 26.061 | 468.934 |
+| 64 | **13.866** | 29.515 | OOM | 403.078 |
+| 128 | **17.033** | 29.547 |  | 788.658 |
+| 256 | **24.381** | 40.070 |  | ?? |
+| 512 | **39.080** | 65.737 |  | ?? |
+| 1024 | **72.238** | 118.572 |  |  |
+| 2048 | OOM | 230.879 |  |  |
 
-#### Without torch compile
 
-| # Parallel Samples | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) | w/ bifurcated attn: Per step latency (ms) | w/o bifurcated attn: Per step latency (ms) |
+
+#### GQA with 16K context length
+
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Flash2 (non contiguous) |
 | --- | --- | --- | --- | --- |
-| Context Size | 4k | 4k | 8k | 8k |
-| 1 | 42.81 | 35.15 | 48.23 | 39.45 |
-| 2 | 44.74 | 35.84 | 46.60 | 52.33 |
-| 4 | 44.49 | 50.31 | 47.32 | 79.68 |
-| 8 | 43.79 | 78.62 | 47.06 | 134.57 |
-| 16 | 45.07 | 135.37 | 46.63 | 244.37 |
-| 32 | 43.78 | 248.51 | 47.19 |  |
-| 64 | 43.57 |  | 46.27 |  |
-| 128 | 44.03 |  | 50.18 |  |
-| 256 | 59.75 |  | 77.64 |  |
-| 512 | 97.42 |  | 129.44 |  |
+| 1 | **15.164** | 30.966 | 23.588 | 25.226 |
+| 2 | **15.985** | 32.155 | 23.782 | 28.531 |
+| 4 | **16.202** | 32.188 | 24.218 | 42.469 |
+| 8 | **16.612** | 32.406 | 24.029 | 70.009 |
+| 16 | **16.682** | 32.846 | 30.194 | 130.772 |
+| 32 | **17.772** | 32.747 | OOM | 244.543 |
+| 64 | **19.900** | 32.067 |  | 482.713 |
+| 128 | **24.899** | 40.258 |  | 465.696 |
+| 256 | **33.760** | 59.418 |  | 915.892 |
+| 512 | OOM | OOM |  | OOM |
+| 1024 |  |  |  |  |
+| 2048 |  |  |  |  |
+
+
+
+#### GQA with 32 K context length
+
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Flash2 (non contiguous) |
+| --- | --- | --- | --- | --- |
+| 1 | **22.786** | 37.204 | 26.635 | 28.197 |
+| 2 | **23.722** | 37.469 | 26.815 | 45.704 |
+| 4 | **23.980** | 37.481 | 27.304 | 72.938 |
+| 8 | **24.586** | 38.120 | 28.355 | 127.956 |
+| 16 | **24.868** | 37.291 | OOM | 245.808 |
+| 32 | **27.005** | 37.844 |  | 467.610 |
+| 64 | **30.313** | 45.731 |  | 463.546 |
+| 128 | **37.601** | 63.055 |  | 909.020 |
+| 256 | **52.064** | 96.277 |  | 1805.599 |
+| 512 | OOM | OOM |  | OOM |
+| 1024 |  |  |  |  |
+| 2048 |  |  |  |  |
+
+
+
+## Applicability with Higher Tensor Parallelism and Model Quantization
+
+We show that our method works out of the box together with other inference techniques such as tensor parallelism (to decrease latency and memory consumption) and model quantization (lower memory consumption). 
+
+
+### Model Quantization with Int8
+
+- Context length 8192 and num parallel samples = 8
+- Note: int8 quantization results in lower memory usage but is slightly slower due to the int8 to floating point conversion which can cause additional IO. However, in each setting, either `int8` or `bf16`, our method is able to improve the latency compared to torch SDPA and FlashAttention2.
+
+|           | Bifurcated | SDPA | Flash2 | Bifurcated + Compile | SDPA + Compile | Flash2 + Compile |
+|-----------|------------|------|--------|----------------------|----------------|------------------|
+| int8      | 44.328     | 92.720 | 76.609 | 21.817               | 24.391         | N/A              |
+| bf16      | 31.332     | 72.637 | 56.363 | 14.394               | OOM            | N/A              |
+
+
+### TP=2 with Mistral 7B (8K context, 8 parallel samples)
+
+- Higher tensor parallelism is usually required to higher inference workload. Our method works out of the box without additional modification for tensor parallelism.
+
+| Context Length | Batch size | SDPA    | Bifurcated | Flash2   |
+| -------------- | ---------- | ------- | ---------- | -------- |
+| 16384          | 16         | 131.460 | 55.515     | 92.115   |
+| 32640          | 8          | 133.851 | 58.555     | 92.354   |
+| 32640          | 16         | 246.531 | 57.995     | 162.016  |
+| 32640          | 32         | OOM     | 57.861     | OOM      |
+| 32640          | 64         |         | 60.325     |          |
+| 32640          | 128        |         | 67.823     |          |
+
+
 
 
 

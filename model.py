@@ -5,13 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 from dataclasses import dataclass
 from typing import Optional
-
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 import math
-
+import os
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -68,12 +69,18 @@ transformer_configs = {
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim,
-                 bifurcated_attn, context_seq_len, max_new_tokens, num_parallel_samples,
+                 bifurcated_kv, bifurcated_attn, context_seq_len, max_new_tokens, num_parallel_samples,
+                use_flash2_prefill=False, use_flash2_decode=False, 
+                use_sdpa_flash=False,
                  dtype=torch.bfloat16):
         super().__init__()
+        self.bifurcated_kv = bifurcated_kv
         self.bifurcated_attn = bifurcated_attn
         self.context_seq_len = context_seq_len
-        if self.bifurcated_attn:
+        self.use_flash2_prefill = use_flash2_prefill
+        self.use_flash2_decode = use_flash2_decode
+        self.use_sdpa_flash = use_sdpa_flash
+        if self.bifurcated_kv:
             context_cache_shape = (1, n_heads, context_seq_len, head_dim)
             dec_cache_shape = (num_parallel_samples, n_heads, max_new_tokens, head_dim)
             self.register_buffer('k_cache_context', torch.zeros(context_cache_shape, dtype=dtype))
@@ -88,8 +95,7 @@ class KVCache(nn.Module):
             self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
 
     def update(self, input_pos, k_val, v_val, prefill=False):
-        # print("Updating. bifurcated attn", self.bifurcated_attn)
-        if self.bifurcated_attn:
+        if self.bifurcated_kv:
             if prefill:
                 assert self.k_cache['context'].shape == k_val.shape
                 self.k_cache['context'][:] = k_val
@@ -97,6 +103,7 @@ class KVCache(nn.Module):
                 return {'context': self.k_cache['context'], 'dec': None}, \
                     {'context': self.v_cache['context'], 'dec': None}
             else:
+                # incremental decoding
                 assert len(input_pos) == 1, f"input_pos: {input_pos} should be of length 1 during decoding"
                 assert k_val.size(-2) == 1
                 new_input_pos = input_pos - self.context_seq_len
@@ -132,28 +139,34 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
 
     def setup_caches(self, max_batch_size, max_seq_length, hard_reset=False,
-                     bifurcated_attn=False, context_seq_len=0, max_new_tokens=0,
-                     parallel_samples=1):
+                     bifurcated_kv=False, bifurcated_attn=False,
+                     context_seq_len=0, max_new_tokens=0,
+                     parallel_samples=1, use_flash2_prefill=False, use_flash2_decode=False,
+                     use_sdpa_flash=False,
+                     ):
+        
+        self.bifurcated_kv = bifurcated_kv
         self.bifurcated_attn = bifurcated_attn
+
         if (not hard_reset) and self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
-        # print("Initial max sequence length", max_seq_length) # 4096
         max_seq_length = find_multiple(max_seq_length, 8)
-        # print("Setting max sequence length to be ", max_seq_length) $ 4200 (4096 + 100  and round to multiples of 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim,
-                                           bifurcated_attn, context_seq_len, max_new_tokens, parallel_samples)
+                                           bifurcated_kv, bifurcated_attn, context_seq_len, max_new_tokens, parallel_samples,
+                                           use_flash2_prefill, use_flash2_decode, use_sdpa_flash
+                                           )
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
-        
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, prefill: bool=False) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos] # [1,1, 8192, 8196]
+        # causal_mask: [1,1, q_len, k_len]
+        mask = self.causal_mask[None, None, input_pos] # a slice along query length
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
@@ -186,6 +199,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
+
 class Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -211,7 +225,8 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None, prefill=False) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None, prefill=False,
+                ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -224,54 +239,141 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
+        """
+            Note: this transpose changes the dim from `bmgk` to `bgmk`
+            FlashAttention2 expects the shape to be `bmhk` where `m` is the sequence length however
+        """
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
+            # for incremental decoding, update kv cache with kv for new tokens
             k, v = self.kv_cache.update(input_pos, k, v, prefill=prefill)
-            if not self.kv_cache.bifurcated_attn:
-                k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-                v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
-            else:
-                if prefill:
-                    k,v = k['context'], v['context']
+        
+        use_flash2_prefill = self.kv_cache.use_flash2_prefill
+        use_flash2_decode = self.kv_cache.use_flash2_decode
+
+        if prefill:
+            if self.kv_cache.bifurcated_kv:
+                k,v = k['context'], v['context']
+            # k = k[:,:,:q.size(-2)]
+            # v = v[:,:,:q.size(-2)]
+
+            if use_flash2_prefill:
+                if not self.gqa_aware:
                     k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
                     v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                # q: bhmk, k: bhmk, v: bhmk -> bnhv
+                q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+                y = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    0.0,
+                    softmax_scale=1/math.sqrt(self.head_dim),
+                    causal=True,
+                ).transpose(1, 2) # bnhv -> bhnv
+            else:
+                k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                # use is_causal=True instead of attn_mask=mask since it is compatible with SDPA flash kernel
+                # and Math SDPA kernel (and much faster as well)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
 
-                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:,:,:,:len(input_pos)], dropout_p=0.0)
-                else:
-                    k_context, k_dec = k['context'], k['dec']
-                    v_context, v_dec = v['context'], v['dec']
-                    
-                    if not self.gqa_aware:
+                # note: above is functionally equivalent to
+                # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+                # or 
+                # y = scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False, dropout_p=0.0)
+                # or 
+                # y = scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0)
+                # or 
+                # y = scaled_dot_product_attention_einsum(q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0)
+        else:
+            # incremental decoding
+            if self.kv_cache.bifurcated_kv:
+                # decode with bifurcated attention
+                k_context, k_dec = k['context'], k['dec']
+                v_context, v_dec = v['context'], v['dec']
+                if self.kv_cache.bifurcated_attn:
+                    if self.gqa_aware:
+                        y = scaled_dot_product_attention_bifurcated_gqa(
+                            q, k_context, k_dec,
+                            v_context, v_dec,
+                            attn_mask=mask, # compatible with compile
+                            # input_pos=input_pos[0], # not compatible with compile
+                        )
+                    else:
                         k_context = k_context.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
                         v_context = v_context.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
                         k_dec = k_dec.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
                         v_dec = v_dec.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                        y = scaled_dot_product_attention_bifurcated(
+                            q, k_context, k_dec,
+                            v_context, v_dec,
+                            attn_mask=mask,
+                        )
+                else:
+                    # join K and V together (use .expand otherwise torch.repeat consume too much memory)
+                    k_context = k_context.expand(q.shape[0], -1, -1, -1)
+                    v_context = v_context.expand(q.shape[0], -1, -1, -1)
+                    k = torch.cat([k_context, k_dec], dim=-2) # bhmk or bgmk | m is at dim = -2
+                    v = torch.cat([v_context, v_dec], dim=-2)
 
-                    mock_bifurcated = False 
-                    if not mock_bifurcated:
-                        # for testing purposes
-                        if self.gqa_aware:
-                            y = scaled_dot_product_attention_bifurcated_gqa(
-                                q, k_context, k_dec,
-                                v_context, v_dec,
-                                attn_mask=None,
-                                dropout_p=0.0
-                            )
-                        else:
-                            y = scaled_dot_product_attention_bifurcated(q, k_context, k_dec,
-                                                                    v_context, v_dec,
-                                                                    attn_mask=None,
-                                                                    dropout_p=0.0
-                                                                    )
+                    if not self.gqa_aware:
+                        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                    
+                    if use_flash2_decode:
+                        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+                        y = flash_attn_func(
+                            q,
+                            k[:,:input_pos[0]+1,:,:],
+                            v[:,:input_pos[0]+1,:,:],
+                            0.0,
+                            softmax_scale=None,
+                            causal=False,
+                        ).transpose(1, 2)
                     else:
-                        k_context = k_context.repeat(q.shape[0], 1, 1, 1)
-                        v_context = v_context.repeat(q.shape[0], 1, 1, 1)
-                        k = torch.cat([k_context, k_dec], dim=-2)
-                        v = torch.cat([v_context, v_dec], dim=-2)
-                        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:,:,:,:k.size(-2)], dropout_p=0.0)
-        
+                        if self.kv_cache.use_sdpa_flash:
+                            k = k[:, :, :input_pos[0]+1]
+                            v = v[:, :, :input_pos[0]+1]
+                            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+                        else:
+                            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+                        
+
+            elif use_flash2_decode:
+                if not self.gqa_aware:
+                    k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                    v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+                # using `:input_pos[0]+1` to avoid attending to future tokens
+                # since we do not use explicit mask
+                y = flash_attn_func(
+                    q,
+                    k[:,:input_pos[0]+1,:,:],
+                    v[:,:input_pos[0]+1,:,:],
+                    0.0,
+                    softmax_scale=None,
+                    causal=False, # true or false yileds the same result for query length = 1
+                ).transpose(1, 2)
+            else:
+                k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
+                if self.kv_cache.use_sdpa_flash:
+                    # compatible with both flash and sdpa
+                    k = k[:,:,:input_pos[0]+1,:]
+                    v = v[:,:,:input_pos[0]+1,:]
+                    y = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+                    # note: is_causal=True cannot be used with flash SDPA
+                    #   Error: flash attention does not support the is_causal flag when seqlen_q != seqlen_k. Got seqlen_q:
+                    #   1 seqlen_k: 8320. If you would like to use causal attention with non-square masks, please see CausalAttnMask.
+                    #   y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+                else:
+                    # below is not compatible with flash SDPA due to attn_mask=mask
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+                
+
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
         y = self.wo(y)
         return y
@@ -314,8 +416,6 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    # print('at rotary - x shape', x.shape)
-    # print('freq_cis', freqs_cis.shape)
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
@@ -329,61 +429,78 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
 
-def scaled_dot_product_attention(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
-    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
-    # attn_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0) if is_causal else attn_mask
+
+# tested and is correct compared to SDPA
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    
+    if is_causal:
+        assert attn_mask is None
+        L, S = query.size(-2), key.size(-2)
+        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
     if attn_mask is not None:
-        print("attn_mask", attn_mask)
-        attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
-        attn_weight = torch.softmax((Q @ K.transpose(-2, -1) * scale_factor) + attn_mask, dim=-1)
-    else:
-        attn_weight = torch.softmax((Q @ K.transpose(-2, -1) * scale_factor), dim=-1)
+        attn_bias = torch.zeros(attn_mask.size(), dtype=query.dtype, device=query.device)
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
-    return attn_weight @ V
+    return attn_weight @ value
 
-def scaled_dot_product_attention_einsum(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
-    # q: bhnk, k: bgmk, v: bgmv
-    # or       k: gmk   v: gmv
-    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
+
+# same as `scaled_dot_product_attention` but uses einsum
+def scaled_dot_product_attention_einsum(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    # q: bhnk, k: bhmk   v: bhmv
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    if is_causal:
+        assert attn_mask is None
+        L, S = query.size(-2), key.size(-2)
+        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
     if attn_mask is not None:
-        attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
-        attn_weight = torch.softmax((torch.einsum("bhnk,bhmk->bhnm", Q, K) * scale_factor) + attn_mask, dim=-1)
-    else:
-        attn_weight = torch.softmax((torch.einsum("bhnk,bhmk->bhnm", Q, K) * scale_factor), dim=-1)
+        attn_bias = torch.zeros(attn_mask.size(), dtype=query.dtype, device=query.device)
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    attn_weight = torch.einsum("bhnk,bhmk->bhnm", query, key) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
-    return torch.einsum("bhnm,bhmv->bhnv", attn_weight, V)
+    return torch.einsum("bhnm,bhmv->bhnv", attn_weight, value)
 
-def scaled_dot_product_attention_bifurcated_context(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
-    # q: bhnk, 
-    #          k: 1gmk   v: 1gmv
-    assert K.size(0) == 1 and V.size(0) == 1, "K should have a batch size of 1 for bifurcated context"
-    scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
-    if attn_mask is not None:
-        attn_mask = attn_mask.masked_fill(not attn_mask, -float('inf')) if attn_mask.dtype==torch.bool else attn_mask
-        attn_weight = torch.softmax((torch.einsum("bhnk,hmk->bhnm", Q, K) * scale_factor) + attn_mask, dim=-1)
-    else:
-        attn_weight = torch.softmax((torch.einsum("bhnk,hmk->bhnm", Q, K) * scale_factor), dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
-    return torch.einsum("bhnm,hmv->bhnv", attn_weight, V)
 
-def scaled_dot_product_attention_bifurcated_incremental(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
-    assert Q.size(-2) == 1, "Q should have a sequence length of 1 for incremental decoding"
-    # note: generalize for speculative decoding
-    return scaled_dot_product_attention_einsum(Q, K, V, attn_mask, dropout_p, is_causal, scale)
-
-def scaled_dot_product_attention_bifurcated(Q, K_context, K_dec, V_context, V_dec, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+def scaled_dot_product_attention_bifurcated(Q, K_context, K_dec, V_context, V_dec, input_pos=None, attn_mask=None, dropout_p=0.0, scale=None):
     # q: bhnk, 
     # context     k: 1hMk   v: 1hMv
     # incremental k: bhmk   v: bhmv
-
     assert K_context.size(0) == 1 and V_context.size(0) == 1, "K should have a batch size of 1 for bifurcated context"
     assert Q.size(-2) == 1, f"At incremental decoding phase with bifurcated attention, expecting query length = 1. Current query length = {Q.size(-2)}"
+    
+    if attn_mask is not None:
+        attn_bias = torch.zeros(*attn_mask.shape, dtype=Q.dtype, device=Q.device)
+        attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+    else:
+        slice_pos_dec = input_pos - K_context.size(-2) + 1
+        K_dec, V_dec = K_dec[:,:,:,slice_pos_dec:], V_dec[:,:,:,slice_pos_dec:]
+        attn_bias = 0
     scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
     attn_weight = torch.softmax(
             (torch.cat([torch.einsum("bhnk,hMk->bhnM", Q, K_context.squeeze(0)),
                         torch.einsum("bhnk,bhmk->bhnm", Q, K_dec)
-                        ], dim=-1) * scale_factor),
+                        ], dim=-1) * scale_factor) + attn_bias,
             dim=-1)
+    
     attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
     M = K_context.size(-2)
     attn_weight_context, attn_weight_dec = attn_weight[:,:,:,:M], attn_weight[:,:,:,M:]
@@ -391,11 +508,10 @@ def scaled_dot_product_attention_bifurcated(Q, K_context, K_dec, V_context, V_de
         torch.einsum("bhnm,bhmv->bhnv", attn_weight_dec, V_dec)
 
 
-def scaled_dot_product_attention_bifurcated_gqa(Q, K_context, K_dec, V_context, V_dec, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+def scaled_dot_product_attention_bifurcated_gqa(Q, K_context, K_dec, V_context, V_dec, input_pos=None, attn_mask=None, dropout_p=0.0, scale=None):
     # q: bhnk, 
     # context     k: 1gMk   v: 1gMv
     # incremental k: bgmk   v: bgmv
-
     assert K_context.size(0) == 1 and V_context.size(0) == 1, "K should have a batch size of 1 for bifurcated context"
     assert Q.size(-2) == 1, f"At incremental decoding phase with bifurcated attention, expecting query length = 1. Current query length = {Q.size(-2)}"
     scale_factor = 1 / math.sqrt(Q.size(-1)) if scale is None else scale
@@ -404,18 +520,24 @@ def scaled_dot_product_attention_bifurcated_gqa(Q, K_context, K_dec, V_context, 
     g = K_context.size(1)
     h = Q.size(1)
     assert h % g == 0
-    Q = Q.view(Q.size(0), -1, g, Q.size(2), Q.size(3))
+    Q = Q.view(Q.size(0),  g, -1, Q.size(2), Q.size(3))
 
-
+    if attn_mask is not None:
+        attn_bias = torch.zeros(*attn_mask.shape, dtype=Q.dtype, device=Q.device)
+        attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+    else:
+        slice_pos_dec = input_pos - K_context.size(-2) + 1
+        K_dec, V_dec = K_dec[:,:,:,slice_pos_dec:], V_dec[:,:,:,slice_pos_dec:]
+        attn_bias = 0
     attn_weight = torch.softmax(
-            (torch.cat([torch.einsum("bpgnk,gMk->bpgnM", Q, K_context.squeeze(0)),
-                        torch.einsum("bpgnk,bgmk->bpgnm", Q, K_dec)
-                        ], dim=-1) * scale_factor),
+            (torch.cat([torch.einsum("bgpnk,gMk->bgpnM", Q, K_context.squeeze(0)),
+                        torch.einsum("bgpnk,bgmk->bgpnm", Q, K_dec)
+                        ], dim=-1) * scale_factor) + attn_bias,
             dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=False)
     M = K_context.size(-2)
     attn_weight_context, attn_weight_dec = attn_weight[:,:,:,:,:M], attn_weight[:,:,:,:,M:]
-    y = torch.einsum("bpgnM,gMv->bpgnv", attn_weight_context, V_context.squeeze(0)) + \
-        torch.einsum("bpgnm,bgmv->bpgnv", attn_weight_dec, V_dec)
+    y = torch.einsum("bgpnM,gMv->bgpnv", attn_weight_context, V_context.squeeze(0)) + \
+        torch.einsum("bgpnm,bgmv->bgpnv", attn_weight_dec, V_dec)
     y = y.reshape(y.size(0), h, y.size(-2), y.size(-1))
     return y
