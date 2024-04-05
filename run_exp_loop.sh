@@ -9,18 +9,150 @@ BIFURCATED_ATTN=(0 1)
 PROMPT_LENGTHS[2]=$((32 * 1024 - 128))
 
 # export GROUP_NAME="compare_bifurcated_v3"
-export GROUP_NAME="compare_bifurcated_v4"
-export CUDA_VISIBLE_DEVICES=7
+export GROUP_NAME="compare_bifurcated"
 
-# Loop through the configurations
+
 for prompt_len in "${PROMPT_LENGTHS[@]}"; do
     for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
-        for bifurcated_attn in "${BIFURCATED_ATTN[@]}"; do
-            # Without compile
-            python generate.py --wandb_group $GROUP_NAME --prompt_len $prompt_len --parallel_samples $parallel_sample --bifurcated_attn $bifurcated_attn --gqa_aware 1
-
-            # With compile
-            python generate.py --wandb_group $GROUP_NAME --prompt_len $prompt_len --parallel_samples $parallel_sample --bifurcated_attn $bifurcated_attn --compile --gqa_aware 1
-        done
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_attn 1 --compile
     done
 done
+
+echo "------------- Done with bifurcated compile -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_attn 1 
+    done
+done
+
+echo "------------- Done with bifurcated normal -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_attn 0 --use_flash2_decode 1 --enable_sdpa_flash 0
+    done
+done
+
+echo "------------- Done with flash 2 native -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_attn 0 --use_flash2_decode 0 --enable_sdpa_flash 0 
+    done
+done
+
+echo "------------- Done with SDPA Math -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_attn 0 --use_flash2_decode 0 --enable_sdpa_flash 0 --compile 
+    done
+done
+
+echo "------------- Done with SDPA Math + Compile -----------------------------"
+
+
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_kv 1 --use_flash2_decode 1 
+    done
+done
+
+echo "------------- Done with native flash 2 non contiguous mode -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # flash via SDPA
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_attn 0 --use_flash2_decode 0 --enable_sdpa_flash 1 
+    done
+done
+
+
+echo "------------- Done with SDPA Flash -----------------------------"
+
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash via SDPA
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 0 --bifurcated_kv 1 --use_flash2_decode 0 --enable_sdpa_flash 1 
+    done
+done
+
+echo "------------- Done with SDPA Flash + Non contiguous -----------------------------"
+
+
+
+echo "---------------- GQA Aware -----------------"
+
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # Bifurcated + compile
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 1 --bifurcated_attn 1 --compile 
+    done
+done
+
+echo "------------- Done with bifurcated compile -----------------------------"
+
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # bifurcated
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 1 --bifurcated_attn 1 
+        
+    done
+done
+
+echo "------------- Done with bifurcated normal -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 1 --bifurcated_attn 0 --use_flash2_decode 1 
+        
+    done
+done
+
+echo "------------- Done with flash 2 contiguous mode -----------------------------"
+
+for prompt_len in "${PROMPT_LENGTHS[@]}"; do
+    for parallel_sample in "${PARALLEL_SAMPLES[@]}"; do
+        # mock + flash2
+        python generate.py --prompt_len $prompt_len --parallel_samples $parallel_sample \
+        --use_flash2_prefill 1 \
+         --gqa_aware 1 --bifurcated_kv 1 --use_flash2_decode 1 
+        
+    done
+done
+
+echo "------------- Done with flash 2 non contiguous mode -----------------------------"
