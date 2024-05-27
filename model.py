@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 from dataclasses import dataclass
 from typing import Optional
-from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 import torch
 import torch.nn as nn
@@ -324,13 +324,13 @@ class Attention(nn.Module):
                     
                     if use_flash2_decode:
                         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
-                        y = flash_attn_func(
+                        y = flash_attn_with_kvcache(
                             q,
-                            k[:,:input_pos[0]+1,:,:],
-                            v[:,:input_pos[0]+1,:,:],
-                            0.0,
-                            softmax_scale=None,
-                            causal=False,
+                            k,
+                            v,
+                            cache_seqlens = int(input_pos[0]+1),
+                            softmax_scale=1/math.sqrt(self.head_dim),
+                            causal=True,
                         ).transpose(1, 2)
                     else:
                         if self.kv_cache.use_sdpa_flash:
@@ -348,13 +348,13 @@ class Attention(nn.Module):
                 q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
                 # using `:input_pos[0]+1` to avoid attending to future tokens
                 # since we do not use explicit mask
-                y = flash_attn_func(
+                y = flash_attn_with_kvcache(
                     q,
-                    k[:,:input_pos[0]+1,:,:],
-                    v[:,:input_pos[0]+1,:,:],
-                    0.0,
-                    softmax_scale=None,
-                    causal=False, # true or false yileds the same result for query length = 1
+                    k,
+                    v,
+                    cache_seqlens = int(input_pos[0]+1),
+                    softmax_scale=1/math.sqrt(self.head_dim),
+                    causal=True,
                 ).transpose(1, 2)
             else:
                 k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
