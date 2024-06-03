@@ -21,7 +21,7 @@ We show different workloads with various number of `parallel samples` where incl
 
 #### MHA 8K Context
 
-| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Flash + Non contiguous + Compile |
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Math + Non contiguous + Compile |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 8.639 | 30.389 | 24.069 | 26.397 | **8.776** | 24.543 | 22.00 | 23.431 | 10.665 |
 | 2 | 11.774 | 31.371 | 24.498 | 28.706 | **10.505** | 31.533 | 24.771 | 31.658 | 14.449 |
@@ -38,7 +38,7 @@ We show different workloads with various number of `parallel samples` where incl
 
 #### MHA 16K Context
 
-| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Flash + Non contiguous + Compile |
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Math + Non contiguous + Compile |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 12.163 | 30.658 | 26.282 | 30.134 | 13.055 | 30.485 | 26.224 | 30.195 | 15.525 |
 | 2 | 17.170 | 32.619 | 37.723 | 44.737 | **15.349** | 51.304 | 38.248 | 51.235 | 22.456 |
@@ -56,7 +56,7 @@ We show different workloads with various number of `parallel samples` where incl
 
 #### MHA 32K Context
 
-| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Flash + Non contiguous + Compile |
+| # Parallel Samples | Bifurcated + Compile | Bifurcated | Flash2 | Torch SDPA Math | Torch SDPA Math + compile | Flash2 + Non contiguous | SDPA Flash | SDPA Flash + Non contiguous | SDPA Math + Non contiguous + Compile |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 20.898 | 39.972 | 37.674 | 44.942 | **19.797** | 67.443 | 37.463 | 67.299 | 30.394 |
 | 2 | **29.338** | 48.614 | 55.941 | 69.224 | OOM | 156.610 | 55.855 | 156.352 | 47.625 |
